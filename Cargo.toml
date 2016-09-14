@@ -1,0 +1,8 @@
+[package]
+name = "procdump"
+version = "0.1.0"
+authors = ["Avi Weinstock <aweinstock314@gmail.com>"]
+
+[dependencies]
+argparse = "0.2.1"
+libc = "0.2.16"
