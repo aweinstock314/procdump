@@ -15,7 +15,7 @@ use std::io::BufReader;
 use std::ops::Range;
 use std::slice;
 use std::error::Error;
-use nom::{Consumer, Producer};
+use nom::Producer;
 
 // TODO: make a lifetime'd iovec wrapper? (this is unsafe as-is)
 fn slice_to_iovec<T>(x: &mut [T]) -> iovec {
@@ -85,57 +85,21 @@ ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsysca
         pathname: nonspace? ,
         || Mapping { vmem: Range { start: start, end: end }, perms: perms.into(), offset: offset, device: dev.into(), inode: inode.into(), pathname: pathname.map(|x| x.into()) }
     ));
-    struct OnePassConsumer<F, I, O, E> {
-        parser: F,
-        state: nom::ConsumerState<Option<O>, nom::Err<I,E>, nom::Move>,
-    }
-    impl<F, I, O, E> OnePassConsumer<F, I, O, E> {
-        fn new(f: F) -> OnePassConsumer<F, I, O, E> {
-            OnePassConsumer {
-                parser: f,
-                state: nom::ConsumerState::Continue(nom::Move::Consume(0)),
-            }
-        }
-    }
-    impl<F, I, O, E> Consumer<I, Option<O>, nom::Err<I,E>, nom::Move> for OnePassConsumer<F, I, O, E> where F: Fn(I) -> nom::IResult<I, O, E> {
-        fn handle(&mut self, input: nom::Input<I>) -> &nom::ConsumerState<Option<O>, nom::Err<I,E>, nom::Move> {
-            self.state = match input {
-                nom::Input::Empty => nom::ConsumerState::Continue(nom::Move::Consume(0)),
-                nom::Input::Eof(None) => nom::ConsumerState::Done(nom::Move::Consume(0), None),
-                nom::Input::Element(i) | nom::Input::Eof(Some(i)) => match (self.parser)(i) {
-                    nom::IResult::Done(i,o) => nom::ConsumerState::Done(nom::Move::Consume(0 /* FIXME: sizeof i? */), Some(o)),
-                    nom::IResult::Error(e) => nom::ConsumerState::Error(e),
-                    nom::IResult::Incomplete(n) => nom::ConsumerState::Continue(nom::Move::Await(n)),
-                },
-            };
-            &self.state
-        }
-        fn state(&self) -> &nom::ConsumerState<Option<O>, nom::Err<I,E>, nom::Move> {
-            &self.state
-        }
-    }
     let filename = format!("/proc/{}/maps", pid);
     if !cfg!(avoid_producerconsumer) {
         let mut producer = try!(FileProducer::new(&filename, 4096));
-        let mut consumer = OnePassConsumer::new(allmappings);
-        return match producer.run(&mut consumer) {
-            None => Err("outer".into()),
-            Some(&None) => Err("inner".into()),
-            Some(&Some(ref x)) => Ok(x.clone()),
-        };
+        consumer_from_parser!(AllMappingsConsumer< Vec<Mapping> >, allmappings);
+        let mut consumer = AllMappingsConsumer::new();
+        Ok(producer.run(&mut consumer).map(|x| x.clone()).unwrap_or(vec![]))
     } else {
         let mut file = BufReader::new(try!(File::open(&filename)));
         let mut buf = vec![];
         try!(file.read_to_end(&mut buf));
-        if let Ok(s) = std::str::from_utf8(&buf) {
-            println!("{}", s);
-        }
-        let allmappings: for<'a> fn(&'a [u8]) -> nom::IResult<&'a [u8], Vec<Mapping>> = allmappings; // type assertion
-        return match allmappings(&buf) {
+        match allmappings(&buf) {
             nom::IResult::Done(_, o) => Ok(o),
             nom::IResult::Error(_) => Err("error".into()),
-            nom::IResult::Incomplete(n) => Err("incomplete".into()),
-        };
+            nom::IResult::Incomplete(_) => Err("incomplete".into()),
+        }
     }
 }
 
