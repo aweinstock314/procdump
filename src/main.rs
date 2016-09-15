@@ -9,6 +9,9 @@ use argparse::{ArgumentParser, Store};
 use byteorder::{BigEndian, ByteOrder};
 use hex::FromHex;
 use libc::{iovec, pid_t, process_vm_readv};
+use std::fs::File;
+use std::io::prelude::*;
+use std::io::BufReader;
 use std::ops::Range;
 use std::slice;
 use std::error::Error;
@@ -37,7 +40,7 @@ struct Mapping {
     offset: usize,
     device: Vec<u8>,
     inode: Vec<u8>,
-    pathname: Vec<u8>,
+    pathname: Option<Vec<u8>>,
 }
 
 fn read_mappings(pid: pid_t) -> Result<Vec<Mapping>, Box<Error>> {
@@ -79,8 +82,8 @@ ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsysca
         offset: hexstring ~ space ~
         dev: nonspace ~ space ~
         inode: digit ~ space ~
-        pathname: nonspace,
-        || Mapping { vmem: Range { start: start, end: end }, perms: perms.into(), offset: offset, device: dev.into(), inode: inode.into(), pathname: pathname.into() }
+        pathname: nonspace? ,
+        || Mapping { vmem: Range { start: start, end: end }, perms: perms.into(), offset: offset, device: dev.into(), inode: inode.into(), pathname: pathname.map(|x| x.into()) }
     ));
     struct OnePassConsumer<F, I, O, E> {
         parser: F,
@@ -111,12 +114,28 @@ ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsysca
             &self.state
         }
     }
-    let mut producer = try!(FileProducer::new(&format!("/proc/{}/maps", pid), 4096));
-    let mut consumer = OnePassConsumer::new(allmappings);
-    match producer.run(&mut consumer) {
-        None => Err("outer".into()),
-        Some(&None) => Err("inner".into()),
-        Some(&Some(ref x)) => Ok(x.clone()),
+    let filename = format!("/proc/{}/maps", pid);
+    if !cfg!(avoid_producerconsumer) {
+        let mut producer = try!(FileProducer::new(&filename, 4096));
+        let mut consumer = OnePassConsumer::new(allmappings);
+        return match producer.run(&mut consumer) {
+            None => Err("outer".into()),
+            Some(&None) => Err("inner".into()),
+            Some(&Some(ref x)) => Ok(x.clone()),
+        };
+    } else {
+        let mut file = BufReader::new(try!(File::open(&filename)));
+        let mut buf = vec![];
+        try!(file.read_to_end(&mut buf));
+        if let Ok(s) = std::str::from_utf8(&buf) {
+            println!("{}", s);
+        }
+        let allmappings: for<'a> fn(&'a [u8]) -> nom::IResult<&'a [u8], Vec<Mapping>> = allmappings; // type assertion
+        return match allmappings(&buf) {
+            nom::IResult::Done(_, o) => Ok(o),
+            nom::IResult::Error(_) => Err("error".into()),
+            nom::IResult::Incomplete(n) => Err("incomplete".into()),
+        };
     }
 }
 

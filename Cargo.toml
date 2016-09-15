@@ -5,4 +5,11 @@ authors = ["Avi Weinstock <aweinstock314@gmail.com>"]
 
 [dependencies]
 argparse = "0.2.1"
+byteorder = "0.5.3"
+hex = "0.2.0"
 libc = "0.2.16"
+nom = "1.2.4"
+
+[features]
+default = []
+avoid_producerconsumer = []
