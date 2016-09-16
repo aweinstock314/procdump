@@ -93,7 +93,7 @@ ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsysca
             pathname: pathname.and_then(|x| std::str::from_utf8(x).ok()).map(|x| x.into()) }
     ));
     let filename = format!("/proc/{}/maps", pid);
-    if !cfg!(avoid_producerconsumer) {
+    if !cfg!(feature="avoid_producerconsumer") {
         let mut producer = try!(FileProducer::new(&filename, 4096));
         consumer_from_parser!(AllMappingsConsumer< Vec<Mapping> >, allmappings);
         let mut consumer = AllMappingsConsumer::new();
@@ -102,6 +102,7 @@ ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsysca
         let mut file = BufReader::new(try!(File::open(&filename)));
         let mut buf = vec![];
         try!(file.read_to_end(&mut buf));
+        //if let Ok(s) = std::str::from_utf8(&buf) { println!("{}", s); } else { println!("{:?}", buf); }
         match allmappings(&buf) {
             nom::IResult::Done(_, o) => Ok(o),
             nom::IResult::Error(_) => Err("error".into()),
@@ -139,8 +140,7 @@ fn main() {
 
     {
         println!("Attempting to read {} bytes of memory from process {} starting at {:x}.", to_read.1, pid, to_read.0);
-        let dests = readmem(pid, &[to_read]);
-        if let Ok(dests) = dests {
+        if let Ok(dests) = readmem(pid, &[to_read]) {
             println!("Result: '{}'", ToHex::to_hex(&dests[0]));
         } else {
             println!("Failed to read memory.");
@@ -148,8 +148,20 @@ fn main() {
     }
 
     if let Ok(mappings) = read_mappings(pid) {
+        let mut readpairs = vec![];
         for mapping in mappings.iter() {
             println!("{}", mapping);
+            let size = mapping.vmem.end - mapping.vmem.start;
+            if size < 0x2000 {
+                readpairs.push((mapping.vmem.start, size));
+            }
+        }
+        println!("{:?}", readpairs);
+        if let Ok(dests) = readmem(pid, &readpairs) {
+            for (dest, (ptr,size)) in dests.iter().zip(readpairs) {
+                println!("{:x}, {:x}: '{}'", ptr, size, ToHex::to_hex(&dest));
+            }
+            println!("-----");
         }
     }
 }
