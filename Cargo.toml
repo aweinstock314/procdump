@@ -12,4 +12,4 @@ nom = "1.2.4"
 
 [features]
 default = []
-avoid_producerconsumer = []
+use_producerconsumer = []

@@ -72,8 +72,8 @@ $ cat /proc/self/maps
 7ffc549c4000-7ffc549c6000 r--p 00000000 00:00 0                          [vvar]
 ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsyscall]
 */
-    use nom::{digit, space, FileProducer};
-    named!(allmappings< &[u8], Vec<Mapping> >, separated_list!(is_a!("\r\n"), mapping));
+    use nom::{digit, eof, multispace, space, FileProducer};
+    named!(allmappings< &[u8], Vec<Mapping> >, chain!(x: separated_list!(is_a!("\r\n"), mapping) ~ multispace ~ eof, || x));
     named!(nonspace< &[u8], &[u8] >, is_not!(" \t\r\n"));
     named!(hexstring< &[u8], usize >, map_res!(is_a!("0123456789abcdef"), |bytes: &[u8]| {
         FromHex::from_hex::<Vec<u8>>(bytes.into())
@@ -93,7 +93,9 @@ ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsysca
             pathname: pathname.and_then(|x| std::str::from_utf8(x).ok()).map(|x| x.into()) }
     ));
     let filename = format!("/proc/{}/maps", pid);
-    if !cfg!(feature="avoid_producerconsumer") {
+    if cfg!(feature="use_producerconsumer") {
+        // this seems to be buggy (doesn't read until EOF consistently, seems to stop at 4046 chars when 
+        //  reading a python REPL's maps, which leads to missing stack/vdso/vsyscall)
         let mut producer = try!(FileProducer::new(&filename, 4096));
         consumer_from_parser!(AllMappingsConsumer< Vec<Mapping> >, allmappings);
         let mut consumer = AllMappingsConsumer::new();
@@ -102,6 +104,7 @@ ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsysca
         let mut file = BufReader::new(try!(File::open(&filename)));
         let mut buf = vec![];
         try!(file.read_to_end(&mut buf));
+        //println!("{}", buf.len());
         //if let Ok(s) = std::str::from_utf8(&buf) { println!("{}", s); } else { println!("{:?}", buf); }
         match allmappings(&buf) {
             nom::IResult::Done(_, o) => Ok(o),
