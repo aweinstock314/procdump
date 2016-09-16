@@ -147,21 +147,24 @@ fn main() {
         }
     }
 
-    if let Ok(mappings) = read_mappings(pid) {
+        if let Ok(mappings) = read_mappings(pid) {
         let mut readpairs = vec![];
         for mapping in mappings.iter() {
             println!("{}", mapping);
             let size = mapping.vmem.end - mapping.vmem.start;
-            if size < 0x2000 {
+            //if size < 0x2000 {
                 readpairs.push((mapping.vmem.start, size));
-            }
+            //}
         }
         println!("{:?}", readpairs);
-        if let Ok(dests) = readmem(pid, &readpairs) {
-            for (dest, (ptr,size)) in dests.iter().zip(readpairs) {
-                println!("{:x}, {:x}: '{}'", ptr, size, ToHex::to_hex(&dest));
+        for (ptr,size) in readpairs {
+            if let Ok(dests) = readmem(pid, &[(ptr,size)]) {
+                /*for (dest, (ptr,size)) in dests.iter().zip(readpairs) {
+                    println!("{:x}, {:x}: '{}'", ptr, size, ToHex::to_hex(&dest));
+                }*/
+                println!("{:x}, {:x}: '{}'", ptr, size, ToHex::to_hex(&dests[0]));
+                println!("-----");
             }
-            println!("-----");
         }
     }
 }
