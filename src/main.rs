@@ -7,11 +7,12 @@ extern crate nom;
 
 use argparse::{ArgumentParser, Store};
 use byteorder::{BigEndian, ByteOrder};
-use hex::FromHex;
+use hex::{FromHex, ToHex};
 use libc::{iovec, pid_t, process_vm_readv};
+use std::fmt::{Display, Formatter};
 use std::fs::File;
-use std::io::prelude::*;
 use std::io::BufReader;
+use std::io::prelude::*;
 use std::ops::Range;
 use std::slice;
 use std::error::Error;
@@ -40,7 +41,19 @@ struct Mapping {
     offset: usize,
     device: Vec<u8>,
     inode: Vec<u8>,
-    pathname: Option<Vec<u8>>,
+    pathname: Option<String>,
+}
+
+fn format_as_string(bytes: &[u8]) -> String {
+    std::str::from_utf8(bytes).unwrap_or("").into()
+}
+
+impl Display for Mapping {
+    fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
+        write!(f, "Mapping {{ Range {{ start: {:x}, end: {:x} }}, perms: {}, offset: {}, device: {}, inode: {}, pathname: {:?} }}",
+            self.vmem.start, self.vmem.end,
+            format_as_string(&self.perms), self.offset, format_as_string(&self.device), format_as_string(&self.inode), self.pathname)
+    }
 }
 
 fn read_mappings(pid: pid_t) -> Result<Vec<Mapping>, Box<Error>> {
@@ -72,9 +85,9 @@ ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsysca
     named!(allmappings< &[u8], Vec<Mapping> >, separated_list!(is_a!("\r\n"), mapping));
     named!(nonspace< &[u8], &[u8] >, is_not!(" \t\r\n"));
     named!(hexstring< &[u8], usize >, map_res!(is_a!("0123456789abcdef"), |bytes: &[u8]| {
-        let decodedbytes: Result<Vec<u8>, _> = FromHex::from_hex::<Vec<u8>>(bytes.into());
-        let paddedbytes = decodedbytes.map(|x| if x.len() < 8 { let mut y = vec![0; 8-x.len()]; y.extend_from_slice(&x); y } else { x });
-        paddedbytes.map(|x| BigEndian::read_u64(&x)).map(|x| x as usize)
+        FromHex::from_hex::<Vec<u8>>(bytes.into())
+            .map(|x: Vec<u8>| if x.len() < 8 { let mut y = vec![0; 8-x.len()]; y.extend_from_slice(&x); y } else { x })
+            .map(|x| BigEndian::read_u64(&x)).map(|x| x as usize)
     }));
     named!(mapping< &[u8], Mapping >, chain!(
         start: hexstring ~ tag!("-") ~ end: hexstring ~ space ~
@@ -83,7 +96,10 @@ ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsysca
         dev: nonspace ~ space ~
         inode: digit ~ space ~
         pathname: nonspace? ,
-        || Mapping { vmem: Range { start: start, end: end }, perms: perms.into(), offset: offset, device: dev.into(), inode: inode.into(), pathname: pathname.map(|x| x.into()) }
+        || Mapping {
+            vmem: Range { start: start, end: end },
+            perms: perms.into(), offset: offset, device: dev.into(), inode: inode.into(),
+            pathname: pathname.and_then(|x| std::str::from_utf8(x).ok()).map(|x| x.into()) }
     ));
     let filename = format!("/proc/{}/maps", pid);
     if !cfg!(avoid_producerconsumer) {
@@ -118,6 +134,10 @@ fn main() {
     let mut dest: Vec<u8> = vec![0; to_read.1];
     println!("Attempting to read {} bytes of memory from process {} starting at {:?}.", iov.iov_len, pid, iov.iov_base);
     let retval = unsafe { process_vm_readv(pid, &slice_to_iovec(&mut dest), 1, &iov, 1, 0) };
-    println!("Result: {}, {:?}", retval, dest);
-    println!("{:?}", read_mappings(pid));
+    println!("Result: {}, {}", retval, ToHex::to_hex(&dest));
+    if let Ok(mappings) = read_mappings(pid) {
+        for mapping in mappings.iter() {
+            println!("{}", mapping);
+        }
+    }
 }
