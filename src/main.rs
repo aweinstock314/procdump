@@ -14,7 +14,6 @@ use std::fs::File;
 use std::io::BufReader;
 use std::io::prelude::*;
 use std::ops::Range;
-use std::slice;
 use std::error::Error;
 use nom::Producer;
 
@@ -25,14 +24,6 @@ fn slice_to_iovec<T>(x: &mut [T]) -> iovec {
         iov_len: x.len(),
     }
 }
-
-fn iovec_to_slice<'a, T>(x: iovec) -> &'a mut [T] {
-    unsafe {
-        slice::from_raw_parts_mut(x.iov_base as _, x.iov_len)
-    }
-}
-
-//fn readmem(pid: pid_t, 
 
 #[derive(Clone, Debug)]
 struct Mapping {
@@ -119,6 +110,21 @@ ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsysca
     }
 }
 
+fn readmem(pid: pid_t, sources: &[(usize, usize)]) -> Result<Vec<Vec<u8>>, ()> {
+    let riovecs: Vec<_> = sources.iter().map(|&(ptr, size)| iovec { iov_base: ptr as _, iov_len: size as _ }).collect();
+    let mut dests: Vec<Vec<u8>> = vec![vec![]; sources.len()];
+    let liovecs: Vec<_> = dests.iter_mut().zip(sources.iter()).map(|(vec, &(_, size))| {
+        vec.resize(size, 0);
+        slice_to_iovec(&mut vec[..])
+    }).collect();
+    let retval = unsafe { process_vm_readv(pid, liovecs.as_ptr(), liovecs.len() as u64, riovecs.as_ptr(), riovecs.len() as u64, 0) };
+    if retval < 0 {
+        Err(())
+    } else {
+        Ok(dests)
+    }
+}
+
 fn main() {
     let mut pid: pid_t = 0;
     let mut to_read: (usize, usize) = (0xffffffffff600000, 0x1000); // hardcode vsyscall as a default
@@ -130,11 +136,17 @@ fn main() {
         ap.refer(&mut to_read.1).metavar("SIZE").add_option(&["-s"], Store, "How many bytes to read");
         ap.parse_args_or_exit();
     }
-    let iov = iovec { iov_base: to_read.0 as _, iov_len: to_read.1 };
-    let mut dest: Vec<u8> = vec![0; to_read.1];
-    println!("Attempting to read {} bytes of memory from process {} starting at {:?}.", iov.iov_len, pid, iov.iov_base);
-    let retval = unsafe { process_vm_readv(pid, &slice_to_iovec(&mut dest), 1, &iov, 1, 0) };
-    println!("Result: {}, {}", retval, ToHex::to_hex(&dest));
+
+    {
+        println!("Attempting to read {} bytes of memory from process {} starting at {:x}.", to_read.1, pid, to_read.0);
+        let dests = readmem(pid, &[to_read]);
+        if let Ok(dests) = dests {
+            println!("Result: '{}'", ToHex::to_hex(&dests[0]));
+        } else {
+            println!("Failed to read memory.");
+        }
+    }
+
     if let Ok(mappings) = read_mappings(pid) {
         for mapping in mappings.iter() {
             println!("{}", mapping);
