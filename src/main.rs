@@ -1,21 +1,25 @@
+#[macro_use] extern crate nom;
 extern crate argparse;
 extern crate byteorder;
 extern crate hex;
 extern crate libc;
-#[macro_use]
-extern crate nom;
+extern crate rand;
+extern crate time;
 
 use argparse::{ArgumentParser, Store};
 use byteorder::{BigEndian, ByteOrder};
 use hex::{FromHex, ToHex};
 use libc::{iovec, pid_t, process_vm_readv};
+use nom::Producer;
+use rand::Rng;
+use rand::distributions::range::SampleRange;
+use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::BufReader;
 use std::io::prelude::*;
 use std::ops::Range;
-use std::error::Error;
-use nom::Producer;
+use time::{Duration, get_time};
 
 // TODO: make a lifetime'd iovec wrapper? (this is unsafe as-is)
 fn slice_to_iovec<T>(x: &mut [T]) -> iovec {
@@ -92,21 +96,34 @@ ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsysca
             perms: perms.into(), offset: offset, device: dev.into(), inode: inode.into(),
             pathname: pathname.and_then(|x| std::str::from_utf8(x).ok()).map(|x| x.into()) }
     ));
-    let filename = format!("/proc/{}/maps", pid);
+    fn logging_allmappings(x: &[u8]) -> nom::IResult<&[u8], Vec<Mapping>> {
+        println!("allmappings's input: {:?}", std::str::from_utf8(&x));
+        let result = allmappings(x);
+        println!("allmappings's result: {:?}", result);
+        result
+    }
+    //let filename = format!("/proc/{}/maps", pid);
+    let filename = format!("tmpmaps");
     if cfg!(feature="use_producerconsumer") {
         // this seems to be buggy (doesn't read until EOF consistently, seems to stop at 4046 chars when 
         //  reading a python REPL's maps, which leads to missing stack/vdso/vsyscall)
-        let mut producer = try!(FileProducer::new(&filename, 4096));
-        consumer_from_parser!(AllMappingsConsumer< Vec<Mapping> >, allmappings);
+        let mut producer = try!(FileProducer::new(&filename, 8192));
+        consumer_from_parser!(AllMappingsConsumer< Vec<Mapping> >, logging_allmappings);
         let mut consumer = AllMappingsConsumer::new();
+        /*println!("{:?}", producer.run(&mut consumer).map(|x| x.clone()).unwrap_or(vec![]));
+        let mut consumer = AllMappingsConsumer::new();
+        println!("{:?}", producer.run(&mut consumer).map(|x| x.clone()).unwrap_or(vec![]));
+        let mut consumer = AllMappingsConsumer::new();
+        println!("{:?}", producer.run(&mut consumer).map(|x| x.clone()).unwrap_or(vec![]));*/
         Ok(producer.run(&mut consumer).map(|x| x.clone()).unwrap_or(vec![]))
+        //Err("foo".into())
     } else {
         let mut file = BufReader::new(try!(File::open(&filename)));
         let mut buf = vec![];
         try!(file.read_to_end(&mut buf));
         //println!("{}", buf.len());
         //if let Ok(s) = std::str::from_utf8(&buf) { println!("{}", s); } else { println!("{:?}", buf); }
-        match allmappings(&buf) {
+        match logging_allmappings(&buf) {
             nom::IResult::Done(_, o) => Ok(o),
             nom::IResult::Error(_) => Err("error".into()),
             nom::IResult::Incomplete(_) => Err("incomplete".into()),
@@ -129,26 +146,15 @@ fn readmem(pid: pid_t, sources: &[(usize, usize)]) -> Result<Vec<Vec<u8>>, ()> {
     }
 }
 
-fn main() {
-    let mut pid: pid_t = 0;
-    let mut to_read: (usize, usize) = (0xffffffffff600000, 0x1000); // hardcode vsyscall as a default
-    {
-        let mut ap = ArgumentParser::new();
-        ap.set_description("Dump a process's memory");
-        ap.refer(&mut pid).metavar("PID").add_argument("pid", Store, "The process id to dump").required();
-        ap.refer(&mut to_read.0).metavar("ADDR").add_option(&["-a"], Store, "What address to read");
-        ap.refer(&mut to_read.1).metavar("SIZE").add_option(&["-s"], Store, "How many bytes to read");
-        ap.parse_args_or_exit();
-    }
-
-    {
-        println!("Attempting to read {} bytes of memory from process {} starting at {:x}.", to_read.1, pid, to_read.0);
+fn dump_process_memory(pid: pid_t, address: usize, size: usize) {
+    /*{
+        println!("Attempting to read {} bytes of memory from process {} starting at {:x}.", size, pid, address);
         if let Ok(dests) = readmem(pid, &[to_read]) {
             println!("Result: '{}'", ToHex::to_hex(&dests[0]));
         } else {
             println!("Failed to read memory.");
         }
-    }
+    }*/
 
         if let Ok(mappings) = read_mappings(pid) {
         let mut readpairs = vec![];
@@ -160,7 +166,7 @@ fn main() {
             //}
         }
         println!("{:?}", readpairs);
-        for (ptr,size) in readpairs {
+        /*for (ptr,size) in readpairs {
             if let Ok(dests) = readmem(pid, &[(ptr,size)]) {
                 /*for (dest, (ptr,size)) in dests.iter().zip(readpairs) {
                     println!("{:x}, {:x}: '{}'", ptr, size, ToHex::to_hex(&dest));
@@ -168,6 +174,53 @@ fn main() {
                 println!("{:x}, {:x}: '{}'", ptr, size, ToHex::to_hex(&dests[0]));
                 println!("-----");
             }
+        }*/
+    }
+}
+
+fn random_bitflips(pid: pid_t) {
+    if let Ok(mappings) = read_mappings(pid) {
+        let time_per_potential_bitflip = Duration::milliseconds(1);
+        let probability_of_bitflip = 0.1;
+        let mut rng = rand::thread_rng();
+
+        let mut last_time = get_time();
+        loop {
+            let cur_time = get_time();
+            let elapsed = cur_time - last_time;
+            if elapsed >= time_per_potential_bitflip {
+                last_time = cur_time;
+                let mapping = &mappings[rng.gen_range(0, mappings.len())];
+                // TODO: process_vm_readv/process_vm_writev to flip a random bit from a random byte
+                println!("{:?}", mapping);
+            }
         }
+    } else {
+        println!("Failed to read/parse /proc/{}/maps", pid);
+    }
+}
+
+fn main() {
+    let mut pid: pid_t = 0;
+    let mut command: String = "".into();
+    // hardcode vsyscall as a default
+    let mut address: usize = 0xffffffffff600000;
+    let mut size: usize = 0x1000;
+    {
+        let mut ap = ArgumentParser::new();
+        ap.set_description("Dump (or poke) a process's memory");
+        ap.refer(&mut command).metavar("COMMAND").add_argument("command", Store, "The command to run {\"dump\",\"bitflip\"}").required();
+        ap.refer(&mut pid).metavar("PID").add_argument("pid", Store, "The process id to dump").required();
+        ap.refer(&mut address).metavar("ADDR").add_option(&["-a"], Store, "What address to read");
+        ap.refer(&mut size).metavar("SIZE").add_option(&["-s"], Store, "How many bytes to read");
+        ap.parse_args_or_exit();
+    }
+
+    match &*command {
+        "dump" => dump_process_memory(pid, address, size),
+        "bitflip" => random_bitflips(pid),
+        x => {
+            println!("Unknown command: \"{}\"", x);
+        },
     }
 }
