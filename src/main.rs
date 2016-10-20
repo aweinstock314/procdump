@@ -9,10 +9,9 @@ extern crate time;
 use argparse::{ArgumentParser, Store};
 use byteorder::{BigEndian, ByteOrder};
 use hex::{FromHex, ToHex};
-use libc::{iovec, pid_t, process_vm_readv};
+use libc::{iovec, perror, pid_t, process_vm_readv, process_vm_writev};
 use nom::Producer;
 use rand::Rng;
-use rand::distributions::range::SampleRange;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
@@ -97,13 +96,13 @@ ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsysca
             pathname: pathname.and_then(|x| std::str::from_utf8(x).ok()).map(|x| x.into()) }
     ));
     fn logging_allmappings(x: &[u8]) -> nom::IResult<&[u8], Vec<Mapping>> {
-        println!("allmappings's input: {:?}", std::str::from_utf8(&x));
+        //println!("allmappings's input: {:?}", std::str::from_utf8(&x));
         let result = allmappings(x);
-        println!("allmappings's result: {:?}", result);
+        //println!("allmappings's result: {:?}", result);
         result
     }
-    //let filename = format!("/proc/{}/maps", pid);
-    let filename = format!("tmpmaps");
+    let filename = format!("/proc/{}/maps", pid);
+    //let filename = format!("tmpmaps");
     if cfg!(feature="use_producerconsumer") {
         // this seems to be buggy (doesn't read until EOF consistently, seems to stop at 4046 chars when 
         //  reading a python REPL's maps, which leads to missing stack/vdso/vsyscall)
@@ -147,14 +146,14 @@ fn readmem(pid: pid_t, sources: &[(usize, usize)]) -> Result<Vec<Vec<u8>>, ()> {
 }
 
 fn dump_process_memory(pid: pid_t, address: usize, size: usize) {
-    /*{
+    {
         println!("Attempting to read {} bytes of memory from process {} starting at {:x}.", size, pid, address);
-        if let Ok(dests) = readmem(pid, &[to_read]) {
+        if let Ok(dests) = readmem(pid, &[(address, size)]) {
             println!("Result: '{}'", ToHex::to_hex(&dests[0]));
         } else {
             println!("Failed to read memory.");
         }
-    }*/
+    }
 
         if let Ok(mappings) = read_mappings(pid) {
         let mut readpairs = vec![];
@@ -166,7 +165,7 @@ fn dump_process_memory(pid: pid_t, address: usize, size: usize) {
             //}
         }
         println!("{:?}", readpairs);
-        /*for (ptr,size) in readpairs {
+        for (ptr,size) in readpairs {
             if let Ok(dests) = readmem(pid, &[(ptr,size)]) {
                 /*for (dest, (ptr,size)) in dests.iter().zip(readpairs) {
                     println!("{:x}, {:x}: '{}'", ptr, size, ToHex::to_hex(&dest));
@@ -174,15 +173,15 @@ fn dump_process_memory(pid: pid_t, address: usize, size: usize) {
                 println!("{:x}, {:x}: '{}'", ptr, size, ToHex::to_hex(&dests[0]));
                 println!("-----");
             }
-        }*/
+        }
     }
 }
 
-fn random_bitflips(pid: pid_t) {
+fn random_bitflips(pid: pid_t, ns: i64, probability_of_bitflip: f64) {
     if let Ok(mappings) = read_mappings(pid) {
-        let time_per_potential_bitflip = Duration::milliseconds(1);
-        let probability_of_bitflip = 0.1;
+        let time_per_potential_bitflip = Duration::nanoseconds(ns);
         let mut rng = rand::thread_rng();
+        let mut byte = 0u8;
 
         let mut last_time = get_time();
         loop {
@@ -190,9 +189,33 @@ fn random_bitflips(pid: pid_t) {
             let elapsed = cur_time - last_time;
             if elapsed >= time_per_potential_bitflip {
                 last_time = cur_time;
-                let mapping = &mappings[rng.gen_range(0, mappings.len())];
-                // TODO: process_vm_readv/process_vm_writev to flip a random bit from a random byte
-                println!("{:?}", mapping);
+                if rng.gen_range(0.0, 1.0) < probability_of_bitflip {
+                    let mapping = &mappings[rng.gen_range(0, mappings.len())];
+                    //println!("{:?}", mapping);
+                    if !mapping.perms.contains(&b'w') {
+                        continue;
+                    }
+                    let their_iov = iovec {
+                        iov_base: rng.gen_range(mapping.vmem.start, mapping.vmem.end) as _,
+                        iov_len: 1,
+                    };
+                    let our_iov = iovec {
+                        iov_base: &mut byte as *mut u8 as _,
+                        iov_len: 1,
+                    };
+                    unsafe { if process_vm_readv(pid, &our_iov, 1, &their_iov, 1, 0) < 0 {
+                        perror(b"readv failed\0".as_ptr() as _);
+                        return;
+                    }}
+                    print!("Attempting to change {:016p} in pid {} from {:02x} to ", their_iov.iov_base, pid, byte);
+                    byte ^= 1 << rng.gen_range(0,8);
+                    println!("{:02x}", byte);
+                    unsafe { if process_vm_writev(pid, &our_iov, 1, &their_iov, 1, 0) < 0 {
+                        perror(b"writev failed\0".as_ptr() as _);
+                        return;
+                    }}
+
+                }
             }
         }
     } else {
@@ -206,6 +229,8 @@ fn main() {
     // hardcode vsyscall as a default
     let mut address: usize = 0xffffffffff600000;
     let mut size: usize = 0x1000;
+    let mut ns_per_bitflip = 800000; // trial and error for "takes a few seconds to kill cat"
+    let mut prob_of_bitflip = 0.1;
     {
         let mut ap = ArgumentParser::new();
         ap.set_description("Dump (or poke) a process's memory");
@@ -213,12 +238,14 @@ fn main() {
         ap.refer(&mut pid).metavar("PID").add_argument("pid", Store, "The process id to dump").required();
         ap.refer(&mut address).metavar("ADDR").add_option(&["-a"], Store, "What address to read");
         ap.refer(&mut size).metavar("SIZE").add_option(&["-s"], Store, "How many bytes to read");
+        ap.refer(&mut ns_per_bitflip).metavar("TIME").add_option(&["-t"], Store, "How many time in nanoseconds per bitflip chance");
+        ap.refer(&mut prob_of_bitflip).metavar("PROBABILITY").add_option(&["-p"], Store, "What probability to flip bits with");
         ap.parse_args_or_exit();
     }
 
     match &*command {
         "dump" => dump_process_memory(pid, address, size),
-        "bitflip" => random_bitflips(pid),
+        "bitflip" => random_bitflips(pid, ns_per_bitflip, prob_of_bitflip),
         x => {
             println!("Unknown command: \"{}\"", x);
         },
