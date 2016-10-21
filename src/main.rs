@@ -6,7 +6,7 @@ extern crate libc;
 extern crate rand;
 extern crate time;
 
-use argparse::{ArgumentParser, Store};
+use argparse::{ArgumentParser, Store, StoreOption};
 use byteorder::{BigEndian, ByteOrder};
 use hex::{FromHex, ToHex};
 use libc::{iovec, perror, pid_t, process_vm_readv, process_vm_writev};
@@ -19,6 +19,7 @@ use std::io::BufReader;
 use std::io::prelude::*;
 use std::ops::Range;
 use time::{Duration, get_time};
+use rand::distributions::{Sample, Weighted, WeightedChoice};
 
 // TODO: make a lifetime'd iovec wrapper? (this is unsafe as-is)
 fn slice_to_iovec<T>(x: &mut [T]) -> iovec {
@@ -76,7 +77,7 @@ $ cat /proc/self/maps
 ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsyscall]
 */
     use nom::{digit, eof, multispace, space, FileProducer};
-    named!(allmappings< &[u8], Vec<Mapping> >, chain!(x: separated_list!(is_a!("\r\n"), mapping) ~ multispace ~ eof, || x));
+    named!(allmappings< &[u8], Vec<Mapping> >, chain!(x: separated_list!(is_a!("\r\n"), mapping) ~ multispace? ~ eof?, || x));
     named!(nonspace< &[u8], &[u8] >, is_not!(" \t\r\n"));
     named!(hexstring< &[u8], usize >, map_res!(is_a!("0123456789abcdef"), |bytes: &[u8]| {
         FromHex::from_hex::<Vec<u8>>(bytes.into())
@@ -103,7 +104,7 @@ ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsysca
     }
     let filename = format!("/proc/{}/maps", pid);
     //let filename = format!("tmpmaps");
-    if cfg!(feature="use_producerconsumer") {
+    let result = if cfg!(feature="use_producerconsumer") {
         // this seems to be buggy (doesn't read until EOF consistently, seems to stop at 4046 chars when 
         //  reading a python REPL's maps, which leads to missing stack/vdso/vsyscall)
         let mut producer = try!(FileProducer::new(&filename, 8192));
@@ -124,10 +125,14 @@ ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsysca
         //if let Ok(s) = std::str::from_utf8(&buf) { println!("{}", s); } else { println!("{:?}", buf); }
         match logging_allmappings(&buf) {
             nom::IResult::Done(_, o) => Ok(o),
-            nom::IResult::Error(_) => Err("error".into()),
-            nom::IResult::Incomplete(_) => Err("incomplete".into()),
+            nom::IResult::Error(e) => Err(format!("Error {:?}", e).as_str().into()),
+            nom::IResult::Incomplete(e) => Err(format!("Incomplete {:?}", e).as_str().into()),
         }
+    };
+    if let Err(ref e) = result {
+        println!("{}", e);
     }
+    result
 }
 
 fn readmem(pid: pid_t, sources: &[(usize, usize)]) -> Result<Vec<Vec<u8>>, ()> {
@@ -177,11 +182,22 @@ fn dump_process_memory(pid: pid_t, address: usize, size: usize) {
     }
 }
 
-fn random_bitflips(pid: pid_t, ns: i64, probability_of_bitflip: f64) {
+fn random_bitflips(pid: pid_t, ns: i64, probability_of_bitflip: f64, only_substring: Option<String>) {
     if let Ok(mappings) = read_mappings(pid) {
         let time_per_potential_bitflip = Duration::nanoseconds(ns);
         let mut rng = rand::thread_rng();
         let mut byte = 0u8;
+
+        let total_size: usize = mappings.iter().map(|m| m.vmem.end - m.vmem.start).sum();
+        let mut weights: Vec<_> = mappings.iter().enumerate().map(|(i, m)| {
+            let size: usize = m.vmem.end - m.vmem.start;
+            let sizefrac: f64 = (size as f64) / (total_size as f64);
+            Weighted {
+                weight: (sizefrac * (u32::max_value() as f64)) as u32,
+                item: i,
+            }
+        }).collect();
+        let mut distribution = WeightedChoice::new(&mut weights);
 
         let mut last_time = get_time();
         loop {
@@ -190,11 +206,26 @@ fn random_bitflips(pid: pid_t, ns: i64, probability_of_bitflip: f64) {
             if elapsed >= time_per_potential_bitflip {
                 last_time = cur_time;
                 if rng.gen_range(0.0, 1.0) < probability_of_bitflip {
-                    let mapping = &mappings[rng.gen_range(0, mappings.len())];
-                    //println!("{:?}", mapping);
-                    if !mapping.perms.contains(&b'w') {
-                        continue;
-                    }
+                    let mapping = (|| { loop {
+                        //let mapping = &mappings[rng.gen_range(0, mappings.len())];
+                        let mapping = &mappings[distribution.sample(&mut rng)];
+                        //println!("{:?}", mapping);
+                        if !mapping.perms.contains(&b'w') {
+                            continue;
+                        }
+                        match (only_substring.as_ref(), mapping.pathname.as_ref()) {
+                            (Some(ref substr), Some(ref pathname)) => {
+                                let substr: &str = substr;
+                                if !pathname.contains(&substr) {
+                                    continue;
+                                }
+                                println!("{}", pathname);
+                            }
+                            (None, _) => (),
+                            (Some(_), None) => continue,
+                        }
+                        return mapping;
+                    }})();
                     let their_iov = iovec {
                         iov_base: rng.gen_range(mapping.vmem.start, mapping.vmem.end) as _,
                         iov_len: 1,
@@ -231,6 +262,7 @@ fn main() {
     let mut size: usize = 0x1000;
     let mut ns_per_bitflip = 800000; // trial and error for "takes a few seconds to kill cat"
     let mut prob_of_bitflip = 0.1;
+    let mut substr = None;
     {
         let mut ap = ArgumentParser::new();
         ap.set_description("Dump (or poke) a process's memory");
@@ -240,12 +272,13 @@ fn main() {
         ap.refer(&mut size).metavar("SIZE").add_option(&["-s"], Store, "How many bytes to read");
         ap.refer(&mut ns_per_bitflip).metavar("TIME").add_option(&["-t"], Store, "How many time in nanoseconds per bitflip chance");
         ap.refer(&mut prob_of_bitflip).metavar("PROBABILITY").add_option(&["-p"], Store, "What probability to flip bits with");
+        ap.refer(&mut substr).add_option(&["--mapsubstr"], StoreOption, "Substring of path to search for");
         ap.parse_args_or_exit();
     }
 
     match &*command {
         "dump" => dump_process_memory(pid, address, size),
-        "bitflip" => random_bitflips(pid, ns_per_bitflip, prob_of_bitflip),
+        "bitflip" => random_bitflips(pid, ns_per_bitflip, prob_of_bitflip, substr),
         x => {
             println!("Unknown command: \"{}\"", x);
         },
